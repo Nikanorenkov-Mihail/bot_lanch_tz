@@ -1,0 +1,8 @@
+services:
+  lunch-bot:
+    build: .
+    container_name: lunch-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
