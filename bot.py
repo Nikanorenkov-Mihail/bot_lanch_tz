@@ -31,6 +31,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -64,6 +65,28 @@ CATEGORIES = [
 CATEGORY_LABELS = dict(CATEGORIES)
 CATEGORY_ORDER = [c for c, _ in CATEGORIES]
 
+# Порядок вывода заказа администратору (как удобно забирать в столовой)
+ADMIN_CATEGORY_ORDER = ["salad", "soup", "garnish", "hot", "drink"]
+
+# Кнопка на телефоне обрезается, поэтому держим подпись короткой и фиксируем
+# место под цену — иначе у длинных названий цена уезжает за край экрана.
+MAX_BUTTON_LABEL = 30
+PRICE_FIELD_WIDTH = 8  # " · 1000₽"
+
+
+def format_button_label(name: str, price) -> str:
+    """Короткая подпись кнопки: название урезается, цена видна всегда."""
+    if price:
+        suffix = f" · {price}₽"
+        budget = MAX_BUTTON_LABEL - PRICE_FIELD_WIDTH
+    else:
+        suffix = ""
+        budget = MAX_BUTTON_LABEL
+    name = name.strip()
+    if len(name) > budget:
+        name = name[: budget - 1].rstrip(" ,.-") + "…"
+    return f"{name}{suffix}"
+
 # Постоянные кнопки внизу экрана — основные действия сотрудника
 BTN_COLLECT = "🍽 Собрать обед"
 BTN_EDIT = "✏️ Изменить текущий обед"
@@ -74,6 +97,7 @@ BTN_ADMIN = "⚙️ Режим администратора"
 BTN_SUMMARY = "📋 Сводка заказа"
 BTN_REMIND = "🔔 Напомнить не ответившим"
 BTN_NOTIFY_TOGGLE = "📢 Рассылка: вкл/выкл"
+BTN_PICKUP = "📦 Забрать заказ"
 BTN_CHECK_MENU = "🔄 Проверить меню сейчас"
 BTN_BACK = "👤 Выйти из режима администратора"
 
@@ -98,6 +122,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_SUMMARY)],
+            [KeyboardButton(text=BTN_PICKUP)],
             [KeyboardButton(text=BTN_REMIND)],
             [KeyboardButton(text=BTN_NOTIFY_TOGGLE)],
             [KeyboardButton(text=BTN_CHECK_MENU)],
@@ -148,7 +173,19 @@ async def start_collecting(tg_id: int, name: str, answer):
         return
     storage.clear_declined(tg_id)
     storage.clear_today_order(tg_id)
+    await send_menu_photo(tg_id)
     await send_category(tg_id, CATEGORY_ORDER[0])
+
+
+async def send_menu_photo(tg_id: int) -> None:
+    """Показывает оригинал фото меню — чтобы сверяться с ним по ходу заказа."""
+    path = menu_store.photo_path()
+    if not path:
+        return
+    try:
+        await bot.send_photo(tg_id, FSInputFile(path), caption="Сегодняшнее меню 👆")
+    except Exception:
+        logging.exception(f"Не удалось отправить фото меню сотруднику {tg_id}")
 
 
 @dp.message(F.text == BTN_COLLECT)
@@ -207,6 +244,7 @@ async def _handle_new_menu(image_bytes: bytes, broadcast_photo):
         return
 
     menu_store.save_menu(menu)
+    menu_store.save_photo(image_bytes)  # понадобится при каждой сборке заказа
 
     if not settings.notifications_enabled():
         for admin_id in config.ADMIN_IDS:
@@ -313,8 +351,7 @@ def build_keyboard(category: str, menu: dict) -> InlineKeyboardMarkup:
     items = menu.get(category) or []
     buttons = []
     for idx, item in enumerate(items):
-        price = f" — {item['price']}₽" if item.get("price") else ""
-        label = f"{item['name']}{price}"[:60]
+        label = format_button_label(item["name"], item.get("price"))
         # В callback_data кладём ИНДЕКС блюда, а не название: лимит Telegram — 64 байта,
         # а кириллическое название легко занимает 90+ байт и кнопка не отправится вовсе.
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"pick|{category}|{idx}")])
@@ -462,13 +499,15 @@ def build_summary_text() -> str:
     for data in per_employee.values():
         for category, (dish, price) in data["order"].items():
             if dish:
-                counts[(CATEGORY_LABELS.get(category, category), dish)] += 1
+                counts[(category, dish)] += 1
         emp_total, _ = pricing.calculate(data["order"])
         total += emp_total
 
     lines = ["Сводный заказ на сегодня:"]
-    for (cat, dish), n in sorted(counts.items()):
-        lines.append(f"{cat} — {dish}: {n} шт.")
+    for category in ADMIN_CATEGORY_ORDER:
+        for (cat, dish), n in sorted(counts.items(), key=lambda kv: kv[0][1]):
+            if cat == category:
+                lines.append(f"{CATEGORY_LABELS[category]} — {dish}: {n} шт.")
     lines.append(f"\nИтого к оплате: {total}₽")
 
     if declined:
@@ -582,6 +621,51 @@ async def on_btn_notify_toggle(message: Message):
              "но сотрудникам отправляться не будет."
     )
     await message.answer(text, reply_markup=admin_keyboard())
+
+
+
+
+def build_pickup_text() -> str:
+    """
+    Список для получения заказа в столовой: по категориям, каждое блюдо на своей
+    строке с количеством — чтобы удобно было сверяться при получении.
+    """
+    rows = storage.get_today_orders()
+    if not rows:
+        return "Заказов на сегодня пока нет."
+
+    # категория -> блюдо -> количество
+    grouped = {}
+    for _tg_id, _emp_name, category, dish, _price in rows:
+        if not dish:
+            continue
+        grouped.setdefault(category, Counter())[dish] += 1
+
+    if not grouped:
+        return "Заказов на сегодня пока нет."
+
+    lines = []
+    total_items = 0
+    for category in ADMIN_CATEGORY_ORDER:
+        dishes = grouped.get(category)
+        if not dishes:
+            continue
+        lines.append(f"{CATEGORY_LABELS[category]}")
+        for dish in sorted(dishes):
+            count = dishes[dish]
+            total_items += count
+            lines.append(f"  • {dish} — {count} шт.")
+        lines.append("")
+
+    lines.append(f"Всего порций: {total_items}")
+    return "\n".join(lines)
+
+
+@dp.message(F.text == BTN_PICKUP)
+async def on_btn_pickup(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(build_pickup_text(), reply_markup=admin_keyboard())
 
 
 @dp.message(F.text == BTN_CHECK_MENU)
