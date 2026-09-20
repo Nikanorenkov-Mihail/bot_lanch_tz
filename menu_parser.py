@@ -4,10 +4,8 @@
 
 Салаты/супы/горячее меняются каждый день — их распознаём с фото.
 Гарниры и напитки в этой столовой почти не меняются и оформлены на фото
-нестандартно (несколько блюд в одной строке) — OCR там путается, поэтому
-берём их из config.DEFAULT_GARNISH / config.DEFAULT_DRINKS. Если состав
-гарниров/напитков в столовой поменяется — просто отредактируйте эти
-списки в config.py.
+одной длинной строкой через запятую — OCR там путается, поэтому берём их
+из config.DEFAULT_GARNISH / config.DEFAULT_DRINKS.
 """
 
 import io
@@ -15,21 +13,12 @@ import re
 from datetime import date
 
 import pytesseract
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 import config
 
-CATEGORY_PATTERNS = [
-    ("salad", re.compile(r"салат", re.IGNORECASE)),
-    ("soup", re.compile(r"^\s*суп\b", re.IGNORECASE)),
-    ("hot", re.compile(r"горячее", re.IGNORECASE)),
-]
-STOP_PATTERNS = re.compile(r"гарнир|напит", re.IGNORECASE)
-
-TRAILING_PRICE_RE = re.compile(r"[\s\-–—:]*?(\d{2,4})\s*(?:руб\.?)?\s*$")
-LEADING_JUNK_RE = re.compile(
-    r"^(?:руб\.?\s*)?[\s.,„\"'\u2022\-\d)]*(?:[a-zA-Zа-яёА-ЯЁ]\.?\s+)?", re.IGNORECASE
-)
+# Целевая ширина картинки перед распознаванием — компромисс точности и скорости
+TARGET_WIDTH = 1600
 
 MONTHS_RU = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
@@ -37,19 +26,35 @@ MONTHS_RU = {
 }
 DATE_RE = re.compile(r"(\d{1,2})\s+(" + "|".join(MONTHS_RU) + r")\s+(\d{4})", re.IGNORECASE)
 
-# Целевая ширина картинки перед распознаванием — компромисс точности и скорости
-TARGET_WIDTH = 1600
-
 # Шапка меню («Чем наполнить Большую тарелку 21 сентября 2026»). OCR нередко
-# разрывает её на две строки, поэтому ловим и по тексту заголовка, и по дате,
-# и по «огрызку» вида «СЕНТЯБРЯ 2026» — салаты в этой столовой идут сразу после.
+# разрывает её на две строки, поэтому ловим и заголовок, и дату, и «огрызок»
+# вида «СЕНТЯБРЯ 2026» — салаты в этой столовой идут сразу после шапки.
 TITLE_RE = re.compile(r"чем\s+наполн|тарелк", re.IGNORECASE)
-COMBO_RE = re.compile(r"комплексн", re.IGNORECASE)
 MONTH_TAIL_RE = re.compile(r"^\W*(" + "|".join(MONTHS_RU) + r")\s*\d{0,4}\W*$", re.IGNORECASE)
+
+# Заголовки разделов ищем В НАЧАЛЕ строки и без ограничения по длине:
+# «Гарниры: 1. Рис — 80руб 2. Макароны...» идёт одной длинной строкой.
+SECTION_HEADERS = [
+    ("salad", re.compile(r"^\W*салат", re.IGNORECASE)),
+    ("soup", re.compile(r"^\W*суп\b", re.IGNORECASE)),
+    ("hot", re.compile(r"^\W*горяч", re.IGNORECASE)),
+]
+# После этих заголовков блюда не собираем — они берутся из config
+STOP_RE = re.compile(r"^\W*(гарнир|напит|комплексн)", re.IGNORECASE)
+# Строка про комплексный обед может встретиться и в середине — это не блюдо
+COMBO_RE = re.compile(r"комплексн", re.IGNORECASE)
+
+TRAILING_PRICE_RE = re.compile(r"[\s\-–—:]*?(\d{2,4})\s*(?:руб\.?)?\s*$")
+# Срезаем нумерацию и мусорные символы, которые OCR любит ставить в начале строки
+LEADING_JUNK_RE = re.compile(r"^(?:руб\.?\s*)?[\s.,;:„“”\"'«»‹›•·°*!\-–—()\[\]{}\d]+", re.IGNORECASE)
+# Номер списка OCR часто читает как букву: «3.» -> «з.», «13.» -> «!з.», «10.» -> «ю».
+# Срезаем одиночную букву с точкой (или без) в самом начале названия.
+LEADING_NUMBERING_RE = re.compile(r"^[a-zA-Zа-яёА-ЯЁ]\.\s*|^[a-zA-Zа-яёА-ЯЁ]\s+(?=[А-ЯЁ])")
+CYRILLIC_RE = re.compile(r"[а-яёА-ЯЁ]")
 
 
 def _extract_date(text: str):
-    """Дата на фото меню (например 'Чем наполнить Большую тарелку 18 сентября 2026') — если найдена."""
+    """Дата на фото меню — ищем по всему тексту, т.к. OCR рвёт шапку на строки."""
     m = DATE_RE.search(text)
     if not m:
         return None
@@ -57,15 +62,27 @@ def _extract_date(text: str):
     month = MONTHS_RU.get(month_name.lower())
     try:
         return date(int(year), month, int(day))
-    except ValueError:
+    except (ValueError, TypeError):
         return None
 
 
 def _clean_name(raw: str) -> str:
     raw = LEADING_JUNK_RE.sub("", raw)
+    raw = LEADING_NUMBERING_RE.sub("", raw)
+    raw = LEADING_JUNK_RE.sub("", raw)  # после срезанной «нумерации» мог остаться мусор
     # Обрубаем описание состава и всё после него. OCR часто читает "(" как "{" или "[".
     raw = re.split(r"[(\[{]", raw, maxsplit=1)[0]
-    return raw.strip(" -–—:.,").strip()
+    return raw.strip(" -–—:.,;").strip()
+
+
+def _looks_like_dish(name: str) -> bool:
+    """Отсеиваем огрызки распознавания вроде ';. миша Уда ©'."""
+    letters = CYRILLIC_RE.findall(name)
+    if len(letters) < 4:
+        return False
+    # в нормальном названии больше половины символов — буквы или пробелы
+    good = sum(1 for ch in name if ch.isalpha() or ch.isspace())
+    return good / max(len(name), 1) >= 0.7
 
 
 def _parse_ocr_text(text: str, start_with_salad: bool = False) -> dict:
@@ -83,7 +100,7 @@ def _parse_ocr_text(text: str, start_with_salad: bool = False) -> dict:
         m = TRAILING_PRICE_RE.search(joined)
         price = int(m.group(1)) if m else None
         name = _clean_name(joined[: m.start()] if m else joined)
-        if len(name) >= 2:
+        if _looks_like_dish(name):
             menu[current].append({"name": name[:60], "price": price})
         buffer = []
 
@@ -92,24 +109,17 @@ def _parse_ocr_text(text: str, start_with_salad: bool = False) -> dict:
         if not line:
             continue
 
-        if COMBO_RE.search(line):  # «Комплексный обед из 3-х блюд ... 440руб» — это не блюдо
-            flush()
-            continue
-
-        if STOP_PATTERNS.search(line) and len(line) < 20:
+        if STOP_RE.match(line) or COMBO_RE.search(line):
             flush()
             current = None
             continue
 
-        matched = next((key for key, pat in CATEGORY_PATTERNS if pat.search(line)), None)
-        if matched and len(line) < 20:
+        matched = next((key for key, pat in SECTION_HEADERS if pat.match(line)), None)
+        if matched:
             flush()
             current = matched
             continue
 
-        # Шапка меню: заголовок, дата целиком, либо её хвост на отдельной строке.
-        # В этой столовой салаты идут сразу после шапки, а заголовок «Салаты»
-        # бывает не на каждом фото — поэтому якорем служит именно шапка.
         if TITLE_RE.search(line) or DATE_RE.search(line) or MONTH_TAIL_RE.match(line):
             flush()
             current = "salad"
@@ -126,26 +136,32 @@ def _parse_ocr_text(text: str, start_with_salad: bool = False) -> dict:
     return menu
 
 
-def parse_menu_image(image_bytes: bytes) -> dict:
-    image = Image.open(io.BytesIO(image_bytes))
+def _preprocess(image: Image.Image) -> Image.Image:
+    """
+    Готовим картинку к OCR. Жёсткая бинаризация съедает тонкие буквы и добавляет
+    мусора, поэтому ограничиваемся автоконтрастом и лёгкой резкостью.
+    """
     gray = ImageOps.grayscale(image)
     w, h = gray.size
-
-    # Апскейл помогает Tesseract на мелком тексте, но на больших фото он только
-    # умножает работу: 4x пикселей = в разы дольше распознавание. Поэтому тянем
-    # к целевой ширине и никогда не увеличиваем больше чем вдвое.
+    # Апскейл помогает на мелком тексте, но на больших фото только замедляет:
+    # тянем к целевой ширине и никогда не увеличиваем больше чем вдвое.
     scale = min(max(TARGET_WIDTH / w, 1.0), 2.0)
     if scale > 1.01:
         gray = gray.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-    big = gray.point(lambda p: 255 if p > 150 else 0)
+    return ImageOps.autocontrast(gray).filter(ImageFilter.SHARPEN)
 
-    text = pytesseract.image_to_string(big, lang="rus", config="--psm 6")
+
+def parse_menu_image(image_bytes: bytes) -> dict:
+    image = Image.open(io.BytesIO(image_bytes))
+    text = pytesseract.image_to_string(_preprocess(image), lang="rus", config="--psm 6")
+
     menu = _parse_ocr_text(text)
     if not menu["salad"] and (menu["soup"] or menu["hot"]):
-        # Шапку не удалось прочитать — пробуем считать салатами всё до первого раздела.
+        # Шапку не удалось прочитать — считаем салатами всё до первого раздела.
         fallback = _parse_ocr_text(text, start_with_salad=True)
         if fallback["salad"]:
             menu["salad"] = fallback["salad"]
+
     menu["garnish"] = config.DEFAULT_GARNISH
     menu["drink"] = config.DEFAULT_DRINKS
     menu["date"] = _extract_date(text)
