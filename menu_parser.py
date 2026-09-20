@@ -40,6 +40,13 @@ DATE_RE = re.compile(r"(\d{1,2})\s+(" + "|".join(MONTHS_RU) + r")\s+(\d{4})", re
 # Целевая ширина картинки перед распознаванием — компромисс точности и скорости
 TARGET_WIDTH = 1600
 
+# Шапка меню («Чем наполнить Большую тарелку 21 сентября 2026»). OCR нередко
+# разрывает её на две строки, поэтому ловим и по тексту заголовка, и по дате,
+# и по «огрызку» вида «СЕНТЯБРЯ 2026» — салаты в этой столовой идут сразу после.
+TITLE_RE = re.compile(r"чем\s+наполн|тарелк", re.IGNORECASE)
+COMBO_RE = re.compile(r"комплексн", re.IGNORECASE)
+MONTH_TAIL_RE = re.compile(r"^\W*(" + "|".join(MONTHS_RU) + r")\s*\d{0,4}\W*$", re.IGNORECASE)
+
 
 def _extract_date(text: str):
     """Дата на фото меню (например 'Чем наполнить Большую тарелку 18 сентября 2026') — если найдена."""
@@ -61,9 +68,10 @@ def _clean_name(raw: str) -> str:
     return raw.strip(" -–—:.,").strip()
 
 
-def _parse_ocr_text(text: str) -> dict:
+def _parse_ocr_text(text: str, start_with_salad: bool = False) -> dict:
+    """start_with_salad=True — запасной проход: считаем салатами всё до первого раздела."""
     menu = {"salad": [], "soup": [], "hot": []}
-    current = None
+    current = "salad" if start_with_salad else None
     buffer = []
 
     def flush():
@@ -84,6 +92,10 @@ def _parse_ocr_text(text: str) -> dict:
         if not line:
             continue
 
+        if COMBO_RE.search(line):  # «Комплексный обед из 3-х блюд ... 440руб» — это не блюдо
+            flush()
+            continue
+
         if STOP_PATTERNS.search(line) and len(line) < 20:
             flush()
             current = None
@@ -95,10 +107,10 @@ def _parse_ocr_text(text: str) -> dict:
             current = matched
             continue
 
-        # Строка-заголовок с датой ("Чем наполнить Большую тарелку 21 сентября 2026").
-        # В этой столовой салаты идут сразу после неё, причём заголовок «Салаты»
-        # бывает не на каждом фото — поэтому дату используем как якорь начала салатов.
-        if DATE_RE.search(line):
+        # Шапка меню: заголовок, дата целиком, либо её хвост на отдельной строке.
+        # В этой столовой салаты идут сразу после шапки, а заголовок «Салаты»
+        # бывает не на каждом фото — поэтому якорем служит именно шапка.
+        if TITLE_RE.search(line) or DATE_RE.search(line) or MONTH_TAIL_RE.match(line):
             flush()
             current = "salad"
             continue
@@ -129,6 +141,11 @@ def parse_menu_image(image_bytes: bytes) -> dict:
 
     text = pytesseract.image_to_string(big, lang="rus", config="--psm 6")
     menu = _parse_ocr_text(text)
+    if not menu["salad"] and (menu["soup"] or menu["hot"]):
+        # Шапку не удалось прочитать — пробуем считать салатами всё до первого раздела.
+        fallback = _parse_ocr_text(text, start_with_salad=True)
+        if fallback["salad"]:
+            menu["salad"] = fallback["salad"]
     menu["garnish"] = config.DEFAULT_GARNISH
     menu["drink"] = config.DEFAULT_DRINKS
     menu["date"] = _extract_date(text)
