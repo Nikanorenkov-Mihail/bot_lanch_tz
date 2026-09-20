@@ -24,6 +24,16 @@ def _conn():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS declines (
+            order_date TEXT NOT NULL,
+            tg_id TEXT NOT NULL,
+            employee_name TEXT NOT NULL,
+            PRIMARY KEY (order_date, tg_id)
+        )
+        """
+    )
     return conn
 
 
@@ -64,5 +74,44 @@ def get_employee_today_order(tg_id: int):
         cur = conn.execute(
             "SELECT category, dish, price FROM orders WHERE order_date = ? AND tg_id = ?",
             (config.today().isoformat(), str(tg_id)),
+        )
+        return cur.fetchall()
+
+
+def set_declined(tg_id: int, name: str) -> None:
+    """Сотрудник сегодня отказался от обеда — его заказ очищается, отказ фиксируется."""
+    with _conn() as conn:
+        today = config.today().isoformat()
+        conn.execute("DELETE FROM orders WHERE order_date = ? AND tg_id = ?", (today, str(tg_id)))
+        conn.execute(
+            "INSERT OR REPLACE INTO declines (order_date, tg_id, employee_name) VALUES (?, ?, ?)",
+            (today, str(tg_id), name),
+        )
+
+
+def clear_declined(tg_id: int) -> None:
+    """Передумал — снимаем отметку об отказе."""
+    with _conn() as conn:
+        conn.execute(
+            "DELETE FROM declines WHERE order_date = ? AND tg_id = ?",
+            (config.today().isoformat(), str(tg_id)),
+        )
+
+
+def is_declined(tg_id: int) -> bool:
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM declines WHERE order_date = ? AND tg_id = ?",
+            (config.today().isoformat(), str(tg_id)),
+        )
+        return cur.fetchone() is not None
+
+
+def get_today_declined():
+    """[(tg_id, employee_name), ...] — кто сегодня отказался от обеда."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "SELECT tg_id, employee_name FROM declines WHERE order_date = ?",
+            (config.today().isoformat(),),
         )
         return cur.fetchall()

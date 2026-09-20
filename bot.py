@@ -28,13 +28,22 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
 import channel_scraper
 import channel_state
 import config
 import employees
 import menu_store
+import pricing
 import settings
 import storage
 from menu_parser import parse_menu_image
@@ -55,6 +64,48 @@ CATEGORIES = [
 CATEGORY_LABELS = dict(CATEGORIES)
 CATEGORY_ORDER = [c for c, _ in CATEGORIES]
 
+# Постоянные кнопки внизу экрана — основные действия сотрудника
+BTN_COLLECT = "🍽 Собрать обед"
+BTN_EDIT = "✏️ Изменить текущий обед"
+BTN_DECLINE = "❌ Отказаться от обеда"
+BTN_ADMIN = "⚙️ Режим администратора"
+
+# Кнопки режима администратора
+BTN_SUMMARY = "📋 Сводка заказа"
+BTN_REMIND = "🔔 Напомнить не ответившим"
+BTN_NOTIFY_TOGGLE = "📢 Рассылка: вкл/выкл"
+BTN_CHECK_MENU = "🔄 Проверить меню сейчас"
+BTN_BACK = "👤 Выйти из режима администратора"
+
+
+def is_admin(tg_id) -> bool:
+    return str(tg_id) in config.ADMIN_IDS
+
+
+def main_keyboard(tg_id) -> ReplyKeyboardMarkup:
+    """Клавиатура сотрудника. Админу дополнительно показываем вход в режим администратора."""
+    rows = [
+        [KeyboardButton(text=BTN_COLLECT)],
+        [KeyboardButton(text=BTN_EDIT)],
+        [KeyboardButton(text=BTN_DECLINE)],
+    ]
+    if is_admin(tg_id):
+        rows.append([KeyboardButton(text=BTN_ADMIN)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def admin_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_SUMMARY)],
+            [KeyboardButton(text=BTN_REMIND)],
+            [KeyboardButton(text=BTN_NOTIFY_TOGGLE)],
+            [KeyboardButton(text=BTN_CHECK_MENU)],
+            [KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True,
+    )
+
 
 # ---------- Регистрация сотрудника ----------
 
@@ -62,13 +113,18 @@ CATEGORY_ORDER = [c for c, _ in CATEGORIES]
 async def cmd_start(message: Message):
     name = employees.get_name(message.from_user.id)
     if name:
-        await message.answer(f"Привет, {name}! Как только в канале появится меню — пришлю кнопки для заказа.")
+        await message.answer(
+            f"Привет, {name}! Выбери действие на кнопках ниже.",
+            reply_markup=main_keyboard(message.from_user.id),
+        )
     else:
         employees.register(message.from_user.id, message.from_user.full_name)
         await message.answer(
             f"Привет! Записал тебя как «{message.from_user.full_name}».\n"
             f"Если хочешь другое имя — напиши /rename Имя Фамилия.\n"
-            f"Как только в канале появится сегодняшнее меню, пришлю кнопки для заказа обеда."
+            f"Как только появится сегодняшнее меню, пришлю его сюда. "
+            f"Собрать или изменить заказ можно кнопками ниже.",
+            reply_markup=main_keyboard(message.from_user.id),
         )
 
 
@@ -81,6 +137,48 @@ async def cmd_rename(message: Message):
         return
     employees.register(message.from_user.id, new_name)
     await message.answer(f"Готово, теперь ты «{new_name}».")
+
+
+# ---------- Основные кнопки сотрудника ----------
+
+async def start_collecting(tg_id: int, name: str, answer):
+    """Запускает сборку обеда с первой категории. answer — функция ответа пользователю."""
+    if not menu_store.load_menu():
+        await answer("Меню на сегодня ещё не пришло. Как только появится — сразу пришлю сюда.")
+        return
+    storage.clear_declined(tg_id)
+    storage.clear_today_order(tg_id)
+    await send_category(tg_id, CATEGORY_ORDER[0])
+
+
+@dp.message(F.text == BTN_COLLECT)
+async def on_btn_collect(message: Message):
+    tg_id = message.from_user.id
+    name = employees.get_name(tg_id) or message.from_user.full_name
+    employees.register(tg_id, name)
+    await start_collecting(tg_id, name, message.answer)
+
+
+@dp.message(F.text == BTN_EDIT)
+async def on_btn_edit(message: Message):
+    tg_id = message.from_user.id
+    name = employees.get_name(tg_id) or message.from_user.full_name
+    employees.register(tg_id, name)
+    if not storage.get_employee_today_order(tg_id):
+        await message.answer("Сегодняшнего заказа пока нет — собираю с нуля.")
+    await start_collecting(tg_id, name, message.answer)
+
+
+@dp.message(F.text == BTN_DECLINE)
+async def on_btn_decline(message: Message):
+    tg_id = message.from_user.id
+    name = employees.get_name(tg_id) or message.from_user.full_name
+    employees.register(tg_id, name)
+    storage.set_declined(tg_id, name)
+    await message.answer(
+        "Записал: сегодня без обеда. Если передумаешь — нажми «🍽 Собрать обед».",
+        reply_markup=main_keyboard(tg_id),
+    )
 
 
 # ---------- Приём меню из канала столовой ----------
@@ -143,7 +241,7 @@ async def on_admin_menu_photo(message: Message):
     работает, даже если автоматический опрос канала (channel_scraper.py)
     почему-то не сработал.
     """
-    if str(message.from_user.id) not in config.ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     await message.answer("Распознаю меню...")
     await process_menu_photo(message.photo[-1])
@@ -175,29 +273,34 @@ def _next_weekday_check(now: datetime, hour: int, minute: int) -> datetime:
     return candidate
 
 
-async def _check_channel_once():
+async def _check_channel_once(force: bool = False) -> bool:
+    """force=True — обработать фото, даже если оно уже обрабатывалось (ручная проверка админом)."""
     try:
         result = await channel_scraper.fetch_latest_photo(config.SOURCE_CHANNEL)
         if not result:
             logging.info("На странице канала столовой не найдено фото")
-            return
+            return False
         photo_url, image_bytes = result
-        if photo_url == channel_state.get_last_photo_url():
+        if not force and photo_url == channel_state.get_last_photo_url():
             logging.info("Фото на странице канала не изменилось с прошлой проверки")
-            return
+            return False
         logging.info("Новое фото меню в канале столовой, распознаю...")
         broadcast_photo = BufferedInputFile(image_bytes, filename="menu.jpg")
         await _handle_new_menu(image_bytes, broadcast_photo)
         channel_state.set_last_photo_url(photo_url)
+        return True
     except Exception:
         logging.exception("Ошибка при проверке канала столовой")
+        return False
 
 
 async def broadcast_menu_to_employees(photo):
     """photo — либо file_id (строка, из Telegram), либо BufferedInputFile (из скрапера канала)."""
     for tg_id in employees.all_employees():
         try:
-            storage.clear_today_order(int(tg_id))  # новое меню — начинаем заказ с чистого листа
+            # новое меню — начинаем день с чистого листа
+            storage.clear_today_order(int(tg_id))
+            storage.clear_declined(int(tg_id))
             # Показываем оригинал фото — если OCR где-то ошибся в названии или цене,
             # сотрудник сразу это увидит и сверит с картинкой.
             await bot.send_photo(int(tg_id), photo, caption="Сегодняшнее меню 👆")
@@ -275,21 +378,19 @@ async def on_pick(callback: CallbackQuery):
 
 
 def format_order_lines(rows) -> list[str]:
-    """rows: [(category, dish, price), ...] — только с чем-то выбранным."""
+    """rows: [(category, dish, price), ...] — то, что выбрал сотрудник."""
     order_map = {category: (dish, price) for category, dish, price in rows}
     lines = []
-    total = 0
     for category, label in CATEGORIES:
         dish, price = order_map.get(category, (None, None))
         if dish:
             price_part = f" — {price}₽" if price else ""
             lines.append(f"{label}: {dish}{price_part}")
-            if price:
-                total += price
     if not lines:
-        lines.append("Пусто — все категории пропущены.")
-    else:
-        lines.append(f"\nИтого: {total}₽")
+        return ["Пусто — все категории пропущены."]
+
+    total, reason = pricing.calculate(order_map)
+    lines.append(f"\nИтого: {total}₽ ({reason})")
     return lines
 
 
@@ -313,6 +414,9 @@ async def on_confirm(callback: CallbackQuery):
     tg_id = callback.from_user.id
     if action == "ok":
         await callback.message.edit_text("Заказ подтверждён, увидимся на обеде 🍽")
+        await bot.send_message(
+            tg_id, "Изменить заказ можно кнопками ниже.", reply_markup=main_keyboard(tg_id)
+        )
     else:
         storage.clear_today_order(tg_id)
         await callback.message.edit_text("Начинаем заново.")
@@ -323,67 +427,94 @@ async def on_confirm(callback: CallbackQuery):
 @dp.message(Command("myorder"))
 async def cmd_myorder(message: Message):
     """Сотрудник в любой момент может посмотреть и пересобрать свой заказ на сегодня."""
-    rows = storage.get_employee_today_order(message.from_user.id)
-    if not rows:
-        await message.answer("На сегодня ты пока ничего не заказал(а). Дождись меню или напиши /start.")
+    tg_id = message.from_user.id
+    if storage.is_declined(tg_id):
+        await message.answer(
+            "Сегодня ты отказался(ась) от обеда. Передумал(а) — нажми «🍽 Собрать обед».",
+            reply_markup=main_keyboard(tg_id),
+        )
         return
-    await show_final_summary(message.from_user.id)
+    if not storage.get_employee_today_order(tg_id):
+        await message.answer(
+            "На сегодня заказа пока нет. Нажми «🍽 Собрать обед».", reply_markup=main_keyboard(tg_id)
+        )
+        return
+    await show_final_summary(tg_id)
 
 
 # ---------- Админ: сводка и напоминания ----------
 
-@dp.message(Command("summary"))
-async def cmd_summary(message: Message):
-    if str(message.from_user.id) not in config.ADMIN_IDS:
-        return
+def build_summary_text() -> str:
+    """Текст сводного заказа — используется и командой /summary, и кнопкой в режиме админа."""
     rows = storage.get_today_orders()
-    if not rows:
-        await message.answer("Пока никто не сделал заказ.")
-        return
+    declined = storage.get_today_declined()
+    if not rows and not declined:
+        return "Пока никто не сделал заказ."
+
+    # Группируем по сотрудникам, чтобы посчитать комплексные обеды у каждого
+    per_employee = {}
+    for tg_id, emp_name, category, dish, price in rows:
+        per_employee.setdefault(tg_id, {"name": emp_name, "order": {}})
+        per_employee[tg_id]["order"][category] = (dish, price)
 
     counts = Counter()
     total = 0
-    answered_ids = set()
-    for tg_id, _, category, dish, price in rows:
-        answered_ids.add(tg_id)
-        if not dish:
-            continue
-        counts[(CATEGORY_LABELS.get(category, category), dish)] += 1
-        if price:
-            total += price
+    for data in per_employee.values():
+        for category, (dish, price) in data["order"].items():
+            if dish:
+                counts[(CATEGORY_LABELS.get(category, category), dish)] += 1
+        emp_total, _ = pricing.calculate(data["order"])
+        total += emp_total
 
     lines = ["Сводный заказ на сегодня:"]
     for (cat, dish), n in sorted(counts.items()):
         lines.append(f"{cat} — {dish}: {n} шт.")
-    lines.append(f"\nПримерная сумма: {total}₽")
+    lines.append(f"\nИтого к оплате: {total}₽")
 
-    not_answered = [n for tg_id, n in employees.all_employees().items() if tg_id not in answered_ids]
+    if declined:
+        lines.append(f"\nБез обеда сегодня: {', '.join(n for _, n in declined)}")
+
+    answered = set(per_employee) | {tg_id for tg_id, _ in declined}
+    not_answered = [n for tg_id, n in employees.all_employees().items() if tg_id not in answered]
     if not_answered:
         lines.append(f"\nЕщё не ответили: {', '.join(not_answered)}")
 
-    await message.answer("\n".join(lines))
+    return "\n".join(lines)
 
 
-@dp.message(Command("remind"))
-async def cmd_remind(message: Message):
-    if str(message.from_user.id) not in config.ADMIN_IDS:
-        return
-    rows = storage.get_today_orders()
-    answered_ids = {row[0] for row in rows}
+async def do_remind() -> int:
+    """Рассылает напоминания тем, кто не ответил. Возвращает число отправленных."""
+    answered = {row[0] for row in storage.get_today_orders()}
+    answered |= {tg_id for tg_id, _ in storage.get_today_declined()}
     sent = 0
     for tg_id, name in employees.all_employees().items():
-        if tg_id not in answered_ids:
+        if tg_id not in answered:
             try:
                 await bot.send_message(int(tg_id), "Напоминание: не забудь сделать заказ обеда 🍽")
                 sent += 1
             except Exception:
                 logging.exception(f"Не удалось отправить напоминание {tg_id}")
+    return sent
+
+
+@dp.message(Command("summary"))
+async def cmd_summary(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(build_summary_text())
+
+
+@dp.message(Command("remind"))
+async def cmd_remind(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    sent = await do_remind()
     await message.answer(f"Напоминания отправлены: {sent}")
 
 
 @dp.message(Command("notify_on"))
 async def cmd_notify_on(message: Message):
-    if str(message.from_user.id) not in config.ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     settings.set_notifications_enabled(True)
     await message.answer("Рассылка меню сотрудникам включена.")
@@ -391,13 +522,86 @@ async def cmd_notify_on(message: Message):
 
 @dp.message(Command("notify_off"))
 async def cmd_notify_off(message: Message):
-    if str(message.from_user.id) not in config.ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     settings.set_notifications_enabled(False)
     await message.answer(
         "Рассылка меню сотрудникам выключена. Канал бот продолжит проверять, "
         "но сотрудников беспокоить не будет (/notify_on — включить обратно)."
     )
+
+
+
+
+# ---------- Режим администратора (всё на кнопках) ----------
+
+@dp.message(F.text == BTN_ADMIN)
+async def on_btn_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    state = "включена" if settings.notifications_enabled() else "выключена"
+    await message.answer(
+        f"Режим администратора. Рассылка сейчас {state}.",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@dp.message(F.text == BTN_BACK)
+async def on_btn_back(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Обычный режим.", reply_markup=main_keyboard(message.from_user.id))
+
+
+@dp.message(F.text == BTN_SUMMARY)
+async def on_btn_summary(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(build_summary_text(), reply_markup=admin_keyboard())
+
+
+@dp.message(F.text == BTN_REMIND)
+async def on_btn_remind(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    sent = await do_remind()
+    text = f"Напоминания отправлены: {sent}" if sent else "Напоминать некому — все уже ответили."
+    await message.answer(text, reply_markup=admin_keyboard())
+
+
+@dp.message(F.text == BTN_NOTIFY_TOGGLE)
+async def on_btn_notify_toggle(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    new_state = not settings.notifications_enabled()
+    settings.set_notifications_enabled(new_state)
+    text = (
+        "Рассылка меню сотрудникам ВКЛЮЧЕНА."
+        if new_state
+        else "Рассылка меню сотрудникам ВЫКЛЮЧЕНА. Меню продолжит распознаваться, "
+             "но сотрудникам отправляться не будет."
+    )
+    await message.answer(text, reply_markup=admin_keyboard())
+
+
+@dp.message(F.text == BTN_CHECK_MENU)
+async def on_btn_check_menu(message: Message):
+    """Проверить канал прямо сейчас, не дожидаясь расписания."""
+    if not is_admin(message.from_user.id):
+        return
+    if not config.SOURCE_CHANNEL:
+        await message.answer(
+            "Канал столовой не задан в .env (SOURCE_CHANNEL). Можно просто переслать мне фото меню.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+    await message.answer(f"Проверяю @{config.SOURCE_CHANNEL}...", reply_markup=admin_keyboard())
+    found = await _check_channel_once(force=True)
+    if not found:
+        await message.answer(
+            "Нового фото в канале не нашёл. Если меню уже опубликовано — перешлите мне фото сюда.",
+            reply_markup=admin_keyboard(),
+        )
 
 
 async def main():
