@@ -53,7 +53,8 @@ def _extract_date(text: str):
 
 def _clean_name(raw: str) -> str:
     raw = LEADING_JUNK_RE.sub("", raw)
-    raw = re.sub(r"\(.*", "", raw)  # обрубаем скобку с составом и всё после неё
+    # Обрубаем описание состава и всё после него. OCR часто читает "(" как "{" или "[".
+    raw = re.split(r"[(\[{]", raw, maxsplit=1)[0]
     return raw.strip(" -–—:.,").strip()
 
 
@@ -89,6 +90,14 @@ def _parse_ocr_text(text: str) -> dict:
         if matched and len(line) < 20:
             flush()
             current = matched
+            continue
+
+        # Строка-заголовок с датой ("Чем наполнить Большую тарелку 21 сентября 2026").
+        # В этой столовой салаты идут сразу после неё, причём заголовок «Салаты»
+        # бывает не на каждом фото — поэтому дату используем как якорь начала салатов.
+        if DATE_RE.search(line):
+            flush()
+            current = "salad"
             continue
 
         if current is None:

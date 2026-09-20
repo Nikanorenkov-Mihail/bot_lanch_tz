@@ -1,8 +1,9 @@
 """Локальное хранение заказов в SQLite (файл лежит в /app/data — монтируется как volume в Docker)."""
 
 import sqlite3
-from datetime import date
 from pathlib import Path
+
+import config
 
 DB_PATH = Path("data/orders.db")
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -35,7 +36,7 @@ def set_order_item(tg_id: int, name: str, category: str, dish, price) -> None:
                 (order_date, tg_id, employee_name, category, dish, price)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (date.today().isoformat(), str(tg_id), name, category, dish, price),
+            (config.today().isoformat(), str(tg_id), name, category, dish, price),
         )
 
 
@@ -43,7 +44,7 @@ def clear_today_order(tg_id: int) -> None:
     with _conn() as conn:
         conn.execute(
             "DELETE FROM orders WHERE order_date = ? AND tg_id = ?",
-            (date.today().isoformat(), str(tg_id)),
+            (config.today().isoformat(), str(tg_id)),
         )
 
 
@@ -52,7 +53,7 @@ def get_today_orders():
     with _conn() as conn:
         cur = conn.execute(
             "SELECT tg_id, employee_name, category, dish, price FROM orders WHERE order_date = ?",
-            (date.today().isoformat(),),
+            (config.today().isoformat(),),
         )
         return cur.fetchall()
 
@@ -62,6 +63,6 @@ def get_employee_today_order(tg_id: int):
     with _conn() as conn:
         cur = conn.execute(
             "SELECT category, dish, price FROM orders WHERE order_date = ? AND tg_id = ?",
-            (date.today().isoformat(), str(tg_id)),
+            (config.today().isoformat(), str(tg_id)),
         )
         return cur.fetchall()

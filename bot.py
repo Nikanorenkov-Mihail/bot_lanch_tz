@@ -21,8 +21,9 @@
 
 import asyncio
 import logging
+import re
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
@@ -73,7 +74,8 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("rename"))
 async def cmd_rename(message: Message):
-    new_name = message.text.replace("/rename", "", 1).strip()
+    # срезаем саму команду, в том числе форму "/rename@имя_бота"
+    new_name = re.sub(r"^/rename(@\S+)?", "", message.text or "", count=1).strip()
     if not new_name:
         await message.answer("Использование: /rename Имя Фамилия")
         return
@@ -94,10 +96,12 @@ async def _handle_new_menu(image_bytes: bytes, broadcast_photo):
         return
 
     menu_date = menu.pop("date", None)
-    if menu_date is not None and menu_date != date.today():
+    logging.info(f"Распознано: дата={menu_date}, салатов={len(menu.get('salad', []))}, "
+                 f"супов={len(menu.get('soup', []))}, горячего={len(menu.get('hot', []))}")
+    if menu_date is not None and menu_date != config.today():
         warning = (
             f"⚠️ На распознанном фото дата {menu_date.strftime('%d.%m.%Y')}, "
-            f"а сегодня {date.today().strftime('%d.%m.%Y')}. Похоже, это не сегодняшнее "
+            f"а сегодня {config.today().strftime('%d.%m.%Y')}. Похоже, это не сегодняшнее "
             f"меню — перешлите актуальное фото боту вручную."
         )
         for admin_id in config.ADMIN_IDS:
@@ -205,18 +209,27 @@ async def broadcast_menu_to_employees(photo):
 def build_keyboard(category: str, menu: dict) -> InlineKeyboardMarkup:
     items = menu.get(category) or []
     buttons = []
-    for item in items:
+    for idx, item in enumerate(items):
         price = f" — {item['price']}₽" if item.get("price") else ""
         label = f"{item['name']}{price}"[:60]
-        # callback_data ограничен 64 байтами — режем название блюда
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"pick|{category}|{item['name'][:45]}")])
-    buttons.append([InlineKeyboardButton(text="Пропустить", callback_data=f"pick|{category}|__skip__")])
+        # В callback_data кладём ИНДЕКС блюда, а не название: лимит Telegram — 64 байта,
+        # а кириллическое название легко занимает 90+ байт и кнопка не отправится вовсе.
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"pick|{category}|{idx}")])
+    buttons.append([InlineKeyboardButton(text="Пропустить", callback_data=f"pick|{category}|skip")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def send_category(tg_id: int, category: str):
     menu = menu_store.load_menu()
     if not menu:
+        return
+    # Если в категории нет блюд (например, OCR не распознал салаты) — не показываем
+    # пустой экран с одной кнопкой «Пропустить», а сразу переходим к следующей.
+    while category is not None and not (menu.get(category) or []):
+        next_idx = CATEGORY_ORDER.index(category) + 1
+        category = CATEGORY_ORDER[next_idx] if next_idx < len(CATEGORY_ORDER) else None
+    if category is None:
+        await show_final_summary(tg_id)
         return
     label = CATEGORY_LABELS[category]
     kb = build_keyboard(category, menu)
@@ -225,33 +238,32 @@ async def send_category(tg_id: int, category: str):
 
 @dp.callback_query(F.data.startswith("pick|"))
 async def on_pick(callback: CallbackQuery):
-    _, category, dish = callback.data.split("|", 2)
+    _, category, choice = callback.data.split("|", 2)
     tg_id = callback.from_user.id
     name = employees.get_name(tg_id) or callback.from_user.full_name
 
     menu = menu_store.load_menu()
-    if not menu:
+    if not menu or category not in CATEGORY_LABELS:
         await callback.answer("Меню на сегодня ещё не пришло — попробуй позже.", show_alert=True)
         return
 
-    price = None
-    if dish != "__skip__":
-        matched = False
-        for item in menu.get(category, []):
-            if item["name"][:45] == dish:
-                price = item.get("price")
-                matched = True
-                break
-        if not matched:
-            # Кнопка из вчерашнего/устаревшего сообщения — блюда с таким именем
-            # в сегодняшнем меню уже нет. Просим начать заново, а не сохраняем мусор.
-            await callback.answer("Это меню уже неактуально. Нажми /start и попробуй снова.", show_alert=True)
-            return
-        storage.set_order_item(tg_id, name, category, dish, price)
-    else:
+    if choice == "skip":
         storage.set_order_item(tg_id, name, category, None, None)
+        shown = "—"
+    else:
+        items = menu.get(category) or []
+        try:
+            item = items[int(choice)]
+        except (ValueError, IndexError):
+            # Кнопка из вчерашнего/устаревшего сообщения — состав меню уже другой.
+            # Просим начать заново, а не сохраняем мусор.
+            await callback.answer(
+                "Это меню уже неактуально. Открой /myorder или дождись нового меню.", show_alert=True
+            )
+            return
+        storage.set_order_item(tg_id, name, category, item["name"], item.get("price"))
+        shown = item["name"]
 
-    shown = "—" if dish == "__skip__" else dish
     await callback.message.edit_text(f"{CATEGORY_LABELS[category]}: {shown} ✅")
     await callback.answer()
 

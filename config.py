@@ -1,4 +1,7 @@
 import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,3 +37,13 @@ DEFAULT_DRINKS = [
     {"name": "Компот с сахаром", "price": 50},
     {"name": "Напиток без сахара (каркаде)", "price": 50},
 ]
+
+
+def today():
+    """Сегодняшняя дата по TIMEZONE, а не по UTC контейнера.
+
+    Важно и для сверки даты на фото, и для даты заказа в БД: контейнер по
+    умолчанию живёт в UTC, и ночью/рано утром его «сегодня» отличается от
+    местного, из-за чего заказы попали бы не в тот день.
+    """
+    return datetime.now(ZoneInfo(TIMEZONE)).date()
