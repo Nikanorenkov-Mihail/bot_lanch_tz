@@ -37,6 +37,9 @@ MONTHS_RU = {
 }
 DATE_RE = re.compile(r"(\d{1,2})\s+(" + "|".join(MONTHS_RU) + r")\s+(\d{4})", re.IGNORECASE)
 
+# Целевая ширина картинки перед распознаванием — компромисс точности и скорости
+TARGET_WIDTH = 1600
+
 
 def _extract_date(text: str):
     """Дата на фото меню (например 'Чем наполнить Большую тарелку 18 сентября 2026') — если найдена."""
@@ -115,8 +118,14 @@ def parse_menu_image(image_bytes: bytes) -> dict:
     image = Image.open(io.BytesIO(image_bytes))
     gray = ImageOps.grayscale(image)
     w, h = gray.size
-    big = gray.resize((w * 2, h * 2), Image.LANCZOS)  # апскейл + бинаризация ощутимо помогают Tesseract
-    big = big.point(lambda p: 255 if p > 150 else 0)
+
+    # Апскейл помогает Tesseract на мелком тексте, но на больших фото он только
+    # умножает работу: 4x пикселей = в разы дольше распознавание. Поэтому тянем
+    # к целевой ширине и никогда не увеличиваем больше чем вдвое.
+    scale = min(max(TARGET_WIDTH / w, 1.0), 2.0)
+    if scale > 1.01:
+        gray = gray.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    big = gray.point(lambda p: 255 if p > 150 else 0)
 
     text = pytesseract.image_to_string(big, lang="rus", config="--psm 6")
     menu = _parse_ocr_text(text)

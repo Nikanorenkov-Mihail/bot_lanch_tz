@@ -168,8 +168,15 @@ async def cmd_rename(message: Message):
 
 async def start_collecting(tg_id: int, name: str, answer):
     """Запускает сборку обеда с первой категории. answer — функция ответа пользователю."""
-    if not menu_store.load_menu():
+    menu = menu_store.load_menu()
+    if not menu:
         await answer("Меню на сегодня ещё не пришло. Как только появится — сразу пришлю сюда.")
+        return
+    if not any(menu.get(c) for c in CATEGORY_ORDER):
+        await answer(
+            "В сегодняшнем меню нет ни одного блюда — похоже, его не удалось прочитать. "
+            "Сообщите ответственному, он обновит меню."
+        )
         return
     storage.clear_declined(tg_id)
     storage.clear_today_order(tg_id)
@@ -220,48 +227,104 @@ async def on_btn_decline(message: Message):
 
 # ---------- Приём меню из канала столовой ----------
 
-async def _handle_new_menu(image_bytes: bytes, broadcast_photo):
-    """Общая логика: распознать фото, сверить дату и разослать — откуда бы оно ни пришло."""
+async def _handle_new_menu(image_bytes: bytes, broadcast_photo, report=None) -> bool:
+    """
+    Распознаёт фото, определяет, на какой день это меню, и сохраняет его.
+    Меню на сегодня рассылается сразу, меню на завтра придерживается до утра.
+    report — функция ответа админу, приславшему фото. Возвращает True, если меню принято.
+    """
+
+    async def tell(text):
+        if report:
+            await report(text)
+        else:
+            for admin_id in config.ADMIN_IDS:
+                await bot.send_message(int(admin_id), text)
+
     try:
-        menu = parse_menu_image(image_bytes)
+        # Tesseract работает секунды и он синхронный: без отдельного потока
+        # он заблокировал бы весь бот, и тот перестал бы отвечать на кнопки.
+        menu = await asyncio.to_thread(parse_menu_image, image_bytes)
     except Exception as e:
         logging.exception("Не удалось распознать меню с фото")
-        for admin_id in config.ADMIN_IDS:
-            await bot.send_message(int(admin_id), f"⚠️ Не смог распознать сегодняшнее меню: {e}")
-        return
+        await tell(f"⚠️ Не смог распознать меню: {e}")
+        return False
 
     menu_date = menu.pop("date", None)
-    logging.info(f"Распознано: дата={menu_date}, салатов={len(menu.get('salad', []))}, "
-                 f"супов={len(menu.get('soup', []))}, горячего={len(menu.get('hot', []))}")
-    if menu_date is not None and menu_date != config.today():
-        warning = (
-            f"⚠️ На распознанном фото дата {menu_date.strftime('%d.%m.%Y')}, "
-            f"а сегодня {config.today().strftime('%d.%m.%Y')}. Похоже, это не сегодняшнее "
-            f"меню — перешлите актуальное фото боту вручную."
-        )
-        for admin_id in config.ADMIN_IDS:
-            await bot.send_message(int(admin_id), warning)
-        return
+    counts = {c: len(menu.get(c) or []) for c in ("salad", "soup", "hot")}
+    logging.info(f"Распознано: дата={menu_date}, салатов={counts['salad']}, "
+                 f"супов={counts['soup']}, горячего={counts['hot']}")
 
-    menu_store.save_menu(menu)
-    menu_store.save_photo(image_bytes)  # понадобится при каждой сборке заказа
+    if not any(counts.values()):
+        await tell(
+            "⚠️ С этого фото не удалось прочитать ни одного блюда. "
+            "Попробуйте прислать фото покрупнее или чётче."
+        )
+        return False
+
+    today = config.today()
+    tomorrow = today + timedelta(days=1)
+    # Дату на фото распознать удаётся не всегда — тогда считаем меню сегодняшним.
+    target = menu_date or today
+
+    if target < today:
+        await tell(
+            f"⚠️ Это меню на {target.strftime('%d.%m.%Y')} — оно уже прошло "
+            f"(сегодня {today.strftime('%d.%m.%Y')}). Не сохраняю."
+        )
+        return False
+
+    if target > tomorrow:
+        await tell(
+            f"⚠️ Это меню на {target.strftime('%d.%m.%Y')} — слишком далеко вперёд "
+            f"(сегодня {today.strftime('%d.%m.%Y')}). Не сохраняю."
+        )
+        return False
+
+    menu_store.save(menu, target, image_bytes)
+    menu_store.cleanup()
+
+    found = f"салатов — {counts['salad']}, супов — {counts['soup']}, горячего — {counts['hot']}"
+
+    if target == tomorrow:
+        await tell(
+            f"✅ Меню на завтра ({target.strftime('%d.%m')}) сохранено: {found}.\n"
+            f"Разошлю сотрудникам завтра в {config.CHECK_HOUR:02d}:{config.CHECK_MINUTE:02d}."
+        )
+        return True
+
+    await tell(f"✅ Меню на сегодня распознано: {found}.")
 
     if not settings.notifications_enabled():
-        for admin_id in config.ADMIN_IDS:
-            await bot.send_message(
-                int(admin_id),
-                "Меню распознано, но рассылка сотрудникам сейчас выключена (/notify_on, чтобы включить).",
-            )
-        return
+        await tell("Рассылка сотрудникам сейчас выключена — меню сохранено, но не разослано.")
+        return True
 
     await broadcast_menu_to_employees(broadcast_photo)
+    menu_store.mark_broadcast(target)
+    return True
 
 
-async def process_menu_photo(photo):
+async def broadcast_today_menu() -> bool:
+    """Рассылает уже сохранённое меню на сегодня (например, принятое вчера вечером)."""
+    today = config.today()
+    if not menu_store.has_menu(today) or menu_store.was_broadcast(today):
+        return False
+    if not settings.notifications_enabled():
+        logging.info("Меню на сегодня есть, но рассылка выключена")
+        return False
+    path = menu_store.photo_path(today)
+    photo = FSInputFile(path) if path else None
+    logging.info("Рассылаю сохранённое меню на сегодня")
+    await broadcast_menu_to_employees(photo)
+    menu_store.mark_broadcast(today)
+    return True
+
+
+async def process_menu_photo(photo, report=None):
     """photo — aiogram PhotoSize из канала (если бот в нём состоит) или от админа в личке."""
     file = await bot.get_file(photo.file_id)
     buffer = await bot.download_file(file.file_path)
-    await _handle_new_menu(buffer.read(), photo.file_id)
+    await _handle_new_menu(buffer.read(), photo.file_id, report=report)
 
 
 @dp.channel_post(F.photo)
@@ -299,6 +362,9 @@ async def poll_source_channel():
         now = datetime.now(tz)
         next_run = _next_weekday_check(now, config.CHECK_HOUR, config.CHECK_MINUTE)
         await asyncio.sleep(max((next_run - now).total_seconds(), 1))
+        # Меню могли принять ещё вчера вечером — тогда просто рассылаем его.
+        if await broadcast_today_menu():
+            continue
         await _check_channel_once()
 
 
@@ -312,7 +378,10 @@ def _next_weekday_check(now: datetime, hour: int, minute: int) -> datetime:
 
 
 async def _check_channel_once(force: bool = False) -> bool:
-    """force=True — обработать фото, даже если оно уже обрабатывалось (ручная проверка админом)."""
+    """
+    Забирает последнее фото из канала и обрабатывает его.
+    force=True — обработать даже если это фото уже обрабатывалось (ручная проверка админом).
+    """
     try:
         result = await channel_scraper.fetch_latest_photo(config.SOURCE_CHANNEL)
         if not result:
@@ -322,11 +391,11 @@ async def _check_channel_once(force: bool = False) -> bool:
         if not force and photo_url == channel_state.get_last_photo_url():
             logging.info("Фото на странице канала не изменилось с прошлой проверки")
             return False
-        logging.info("Новое фото меню в канале столовой, распознаю...")
+        logging.info("Обрабатываю фото из канала столовой...")
         broadcast_photo = BufferedInputFile(image_bytes, filename="menu.jpg")
-        await _handle_new_menu(image_bytes, broadcast_photo)
+        accepted = await _handle_new_menu(image_bytes, broadcast_photo)
         channel_state.set_last_photo_url(photo_url)
-        return True
+        return accepted
     except Exception:
         logging.exception("Ошибка при проверке канала столовой")
         return False
@@ -670,7 +739,7 @@ async def on_btn_pickup(message: Message):
 
 @dp.message(F.text == BTN_CHECK_MENU)
 async def on_btn_check_menu(message: Message):
-    """Проверить канал прямо сейчас, не дожидаясь расписания."""
+    """Смотрит последнее сообщение канала и докладывает, на какой день там меню."""
     if not is_admin(message.from_user.id):
         return
     if not config.SOURCE_CHANNEL:
@@ -679,13 +748,29 @@ async def on_btn_check_menu(message: Message):
             reply_markup=admin_keyboard(),
         )
         return
-    await message.answer(f"Проверяю @{config.SOURCE_CHANNEL}...", reply_markup=admin_keyboard())
-    found = await _check_channel_once(force=True)
-    if not found:
-        await message.answer(
-            "Нового фото в канале не нашёл. Если меню уже опубликовано — перешлите мне фото сюда.",
-            reply_markup=admin_keyboard(),
+
+    await message.answer(f"Смотрю последнее сообщение в @{config.SOURCE_CHANNEL}...")
+    # force=True: проверяем заново, даже если это фото уже разбирали
+    await _check_channel_once(force=True)
+
+    today = config.today()
+    tomorrow = today + timedelta(days=1)
+    lines = []
+    if menu_store.has_menu(today):
+        state = "разослано сотрудникам" if menu_store.was_broadcast(today) else "ещё не разослано"
+        lines.append(f"📅 На сегодня ({today.strftime('%d.%m')}): меню есть, {state}.")
+    else:
+        lines.append(f"📅 На сегодня ({today.strftime('%d.%m')}): меню нет.")
+
+    if menu_store.has_menu(tomorrow):
+        lines.append(
+            f"📅 На завтра ({tomorrow.strftime('%d.%m')}): меню есть, "
+            f"разошлю утром в {config.CHECK_HOUR:02d}:{config.CHECK_MINUTE:02d}."
         )
+    else:
+        lines.append(f"📅 На завтра ({tomorrow.strftime('%d.%m')}): меню пока нет.")
+
+    await message.answer("\n".join(lines), reply_markup=admin_keyboard())
 
 
 async def main():

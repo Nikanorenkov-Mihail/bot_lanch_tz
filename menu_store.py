@@ -1,19 +1,82 @@
-"""Хранение меню на сегодня в локальном JSON-файле (переживает перезапуск бота)."""
+"""
+Хранение меню с привязкой к дате, на которую оно действует.
+
+Столовая часто выкладывает меню накануне вечером, поэтому меню на завтра
+нужно принять и придержать до утра, а не отвергать как «не сегодняшнее».
+Для каждой даты храним JSON с блюдами и оригинал фото.
+"""
 
 import json
+from datetime import date
 from pathlib import Path
 
-MENU_FILE = Path("data/today_menu.json")
-MENU_FILE.parent.mkdir(parents=True, exist_ok=True)
+import config
+
+DATA_DIR = Path("data/menus")
+DATA_DIR.parent.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def save_menu(menu: dict) -> None:
-    with open(MENU_FILE, "w", encoding="utf-8") as f:
-        json.dump(menu, f, ensure_ascii=False, indent=2)
+def _menu_file(day: date) -> Path:
+    return DATA_DIR / f"{day.isoformat()}.json"
 
 
-def load_menu():
-    if not MENU_FILE.exists():
+def _photo_file(day: date) -> Path:
+    return DATA_DIR / f"{day.isoformat()}.jpg"
+
+
+def save(menu: dict, day: date, image_bytes: bytes | None = None) -> None:
+    payload = {"menu": menu, "broadcast": False}
+    _menu_file(day).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if image_bytes:
+        _photo_file(day).write_bytes(image_bytes)
+
+
+def _payload(day: date):
+    path = _menu_file(day)
+    if not path.exists():
         return None
-    with open(MENU_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def load_menu(day: date | None = None):
+    """Меню на указанный день (по умолчанию — на сегодня), либо None."""
+    payload = _payload(day or config.today())
+    return payload["menu"] if payload else None
+
+
+def photo_path(day: date | None = None):
+    path = _photo_file(day or config.today())
+    return path if path.exists() else None
+
+
+def has_menu(day: date) -> bool:
+    return _menu_file(day).exists()
+
+
+def was_broadcast(day: date) -> bool:
+    payload = _payload(day)
+    return bool(payload and payload.get("broadcast"))
+
+
+def mark_broadcast(day: date) -> None:
+    payload = _payload(day)
+    if not payload:
+        return
+    payload["broadcast"] = True
+    _menu_file(day).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def cleanup(keep_days: int = 7) -> None:
+    """Убираем меню старше keep_days, чтобы каталог не рос бесконечно."""
+    today = config.today()
+    for path in list(DATA_DIR.glob("*.json")) + list(DATA_DIR.glob("*.jpg")):
+        try:
+            day = date.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        if (today - day).days > keep_days:
+            path.unlink(missing_ok=True)
