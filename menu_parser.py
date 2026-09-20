@@ -39,17 +39,21 @@ SECTION_HEADERS = [
     ("soup", re.compile(r"^\W*суп\b", re.IGNORECASE)),
     ("hot", re.compile(r"^\W*горяч", re.IGNORECASE)),
 ]
-# После этих заголовков блюда не собираем — они берутся из config
-STOP_RE = re.compile(r"^\W*(гарнир|напит|комплексн)", re.IGNORECASE)
-# Строка про комплексный обед может встретиться и в середине — это не блюдо
+# После этих заголовков блюда не собираем — гарниры и напитки берём из config.
+# OCR часто искажает эти слова («Гарниры»->«Гарциры», «Напитки»->«Наинуки»),
+# поэтому допускаем частые варианты замены соседних букв.
+STOP_RE = re.compile(r"^\W*(гар[нцп]и|гарнир|напит|наинук|наин)", re.IGNORECASE)
+# Строка про комплексный обед может встретиться и в середине — это не блюдо,
+# но раздел на ней не закрываем: после неё в том же разделе идут обычные блюда.
 COMBO_RE = re.compile(r"комплексн", re.IGNORECASE)
 
 TRAILING_PRICE_RE = re.compile(r"[\s\-–—:]*?(\d{2,4})\s*(?:руб\.?)?\s*$")
 # Срезаем нумерацию и мусорные символы, которые OCR любит ставить в начале строки
 LEADING_JUNK_RE = re.compile(r"^(?:руб\.?\s*)?[\s.,;:„“”\"'«»‹›•·°*!\-–—()\[\]{}\d]+", re.IGNORECASE)
-# Номер списка OCR часто читает как букву: «3.» -> «з.», «13.» -> «!з.», «10.» -> «ю».
-# Срезаем одиночную букву с точкой (или без) в самом начале названия.
-LEADING_NUMBERING_RE = re.compile(r"^[a-zA-Zа-яёА-ЯЁ]\.\s*|^[a-zA-Zа-яёА-ЯЁ]\s+(?=[А-ЯЁ])")
+# Номер списка OCR часто читает как букву с точкой: «3.» -> «з.», «10.» -> «ю.».
+# Срезаем одиночную букву С ТОЧКОЙ в начале названия. Вариант «буква + пробел»
+# намеренно не трогаем — он съедал бы настоящие короткие слова («С грибами»).
+LEADING_NUMBERING_RE = re.compile(r"^[a-zA-Zа-яёА-ЯЁ]\.\s*")
 CYRILLIC_RE = re.compile(r"[а-яёА-ЯЁ]")
 
 
@@ -78,11 +82,19 @@ def _clean_name(raw: str) -> str:
 def _looks_like_dish(name: str) -> bool:
     """Отсеиваем огрызки распознавания вроде ';. миша Уда ©'."""
     letters = CYRILLIC_RE.findall(name)
-    if len(letters) < 4:
+    # Порог 2 буквы, чтобы не терять короткие настоящие названия («Уха», «Щи»).
+    if len(letters) < 2:
         return False
     # в нормальном названии больше половины символов — буквы или пробелы
     good = sum(1 for ch in name if ch.isalpha() or ch.isspace())
     return good / max(len(name), 1) >= 0.7
+
+
+def _is_bare_header(line: str) -> bool:
+    """True для голого заголовка раздела («Салаты», «Суп», «Горячее») —
+    короткая строка без цифр. Если на строке есть цена или длинное название,
+    это уже блюдо (например «Суп харчо — 90»), а не просто заголовок."""
+    return len(line) <= 14 and not any(ch.isdigit() for ch in line)
 
 
 def _parse_ocr_text(text: str, start_with_salad: bool = False) -> dict:
@@ -109,7 +121,14 @@ def _parse_ocr_text(text: str, start_with_salad: bool = False) -> dict:
         if not line:
             continue
 
-        if STOP_RE.match(line) or COMBO_RE.search(line):
+        # «Комплексный обед из 3-х блюд …» — не блюдо, но раздел НЕ закрываем:
+        # после него в том же разделе могут идти обычные блюда.
+        if COMBO_RE.search(line):
+            flush()
+            continue
+
+        # Гарниры/напитки берём из config — на этих заголовках сбор прекращаем.
+        if STOP_RE.match(line):
             flush()
             current = None
             continue
@@ -118,6 +137,13 @@ def _parse_ocr_text(text: str, start_with_salad: bool = False) -> dict:
         if matched:
             flush()
             current = matched
+            # Заголовок может быть совмещён с блюдом или сам быть блюдом, если
+            # бумажный заголовок раздела пропущен: «Суп харчо — 90». Тогда строку
+            # тоже записываем, а не теряем.
+            if not _is_bare_header(line):
+                buffer.append(line)
+                if TRAILING_PRICE_RE.search(line):
+                    flush()
             continue
 
         if TITLE_RE.search(line) or DATE_RE.search(line) or MONTH_TAIL_RE.match(line):
