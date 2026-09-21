@@ -65,8 +65,32 @@ CATEGORIES = [
 CATEGORY_LABELS = dict(CATEGORIES)
 CATEGORY_ORDER = [c for c, _ in CATEGORIES]
 
-# Порядок вывода заказа администратору (как удобно забирать в столовой)
-ADMIN_CATEGORY_ORDER = ["salad", "soup", "garnish", "hot", "drink"]
+# Порядок вывода заказа администратору (как удобно забирать в столовой).
+# Горячее и гарнир забирают одной тарелкой, поэтому в сводке и в списке на
+# получение они идут одной позицией «Горячее с гарниром». Салат и суп —
+# по-прежнему отдельными строками.
+HOT_GARNISH = "hot_garnish"
+ADMIN_CATEGORY_ORDER = ["salad", "soup", HOT_GARNISH, "drink"]
+ADMIN_CATEGORY_LABELS = {**CATEGORY_LABELS, HOT_GARNISH: "🍗 Горячее с гарниром"}
+
+
+def combined_order(order: dict) -> dict:
+    """Схлопывает горячее и гарнир в одну позицию — их забирают одной тарелкой.
+
+    order: {категория: (блюдо, цена)}. Возвращает {категория: блюдо}, где
+    горячее и гарнир объединены под ключом HOT_GARNISH как «Котлета + Рис».
+    """
+    result = {}
+    for cat in ("salad", "soup", "drink"):
+        dish = (order.get(cat) or (None, None))[0]
+        if dish:
+            result[cat] = dish
+    hot = (order.get("hot") or (None, None))[0]
+    garnish = (order.get("garnish") or (None, None))[0]
+    parts = [p for p in (hot, garnish) if p]
+    if parts:
+        result[HOT_GARNISH] = " + ".join(parts)
+    return result
 
 # Кнопка на телефоне обрезается, поэтому держим подпись короткой и фиксируем
 # место под цену — иначе у длинных названий цена уезжает за край экрана.
@@ -566,9 +590,8 @@ def build_summary_text() -> str:
     counts = Counter()
     total = 0
     for data in per_employee.values():
-        for category, (dish, price) in data["order"].items():
-            if dish:
-                counts[(category, dish)] += 1
+        for category, dish in combined_order(data["order"]).items():
+            counts[(category, dish)] += 1
         emp_total, _ = pricing.calculate(data["order"])
         total += emp_total
 
@@ -576,7 +599,7 @@ def build_summary_text() -> str:
     for category in ADMIN_CATEGORY_ORDER:
         for (cat, dish), n in sorted(counts.items(), key=lambda kv: kv[0][1]):
             if cat == category:
-                lines.append(f"{CATEGORY_LABELS[category]} — {dish}: {n} шт.")
+                lines.append(f"{ADMIN_CATEGORY_LABELS[category]} — {dish}: {n} шт.")
     lines.append(f"\nИтого к оплате: {total}₽")
 
     if declined:
@@ -703,12 +726,16 @@ def build_pickup_text() -> str:
     if not rows:
         return "Заказов на сегодня пока нет."
 
-    # категория -> блюдо -> количество
+    # Собираем заказ каждого сотрудника, чтобы объединить его горячее с гарниром
+    per_employee = {}
+    for tg_id, _emp_name, category, dish, price in rows:
+        per_employee.setdefault(tg_id, {})[category] = (dish, price)
+
+    # категория/комбо -> блюдо -> количество
     grouped = {}
-    for _tg_id, _emp_name, category, dish, _price in rows:
-        if not dish:
-            continue
-        grouped.setdefault(category, Counter())[dish] += 1
+    for order in per_employee.values():
+        for category, dish in combined_order(order).items():
+            grouped.setdefault(category, Counter())[dish] += 1
 
     if not grouped:
         return "Заказов на сегодня пока нет."
@@ -719,7 +746,7 @@ def build_pickup_text() -> str:
         dishes = grouped.get(category)
         if not dishes:
             continue
-        lines.append(f"{CATEGORY_LABELS[category]}")
+        lines.append(f"{ADMIN_CATEGORY_LABELS[category]}")
         for dish in sorted(dishes):
             count = dishes[dish]
             total_items += count
