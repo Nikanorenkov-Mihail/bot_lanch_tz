@@ -337,6 +337,13 @@ async def _handle_new_menu(image_bytes: bytes, broadcast_photo, report=None, bro
         # Флаг broadcast не выставляем — утренняя рассылка пройдёт как обычно.
         return True
 
+    if menu_store.was_broadcast(target):
+        # Сотрудники должны получать меню один раз в день. Если сегодня уже
+        # рассылали (например, утром в 10:00), второй раз не отправляем —
+        # меню просто обновляется в хранилище для /myorder и новых заказов.
+        await tell("Меню сотрудникам сегодня уже рассылалось — повторно не отправляю, только обновил.")
+        return True
+
     if not settings.notifications_enabled():
         await tell("Рассылка сотрудникам сейчас выключена — меню сохранено, но не разослано.")
         return True
