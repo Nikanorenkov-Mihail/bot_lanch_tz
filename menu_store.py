@@ -25,8 +25,12 @@ def _photo_file(day: date) -> Path:
     return DATA_DIR / f"{day.isoformat()}.jpg"
 
 
-def save(menu: dict, day: date, image_bytes: bytes | None = None) -> None:
-    payload = {"menu": menu, "broadcast": False}
+def save(menu: dict, day: date, image_bytes: bytes | None = None, method: str | None = None) -> None:
+    # Флаг «разослано» сохраняем при пересохранении того же дня — чтобы повторное
+    # распознавание (например, ручная проверка) не сбрасывало уже прошедшую рассылку.
+    existing = _payload(day)
+    broadcast = bool(existing.get("broadcast")) if existing else False
+    payload = {"menu": menu, "broadcast": broadcast, "method": method}
     _menu_file(day).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     if image_bytes:
         _photo_file(day).write_bytes(image_bytes)
@@ -60,6 +64,12 @@ def has_menu(day: date) -> bool:
 def was_broadcast(day: date) -> bool:
     payload = _payload(day)
     return bool(payload and payload.get("broadcast"))
+
+
+def recognition_method(day: date | None = None):
+    """'vlm' | 'ocr' | None — каким способом распозналось сохранённое меню."""
+    payload = _payload(day or config.today())
+    return payload.get("method") if payload else None
 
 
 def mark_broadcast(day: date) -> None:
