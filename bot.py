@@ -154,15 +154,14 @@ def main_keyboard(tg_id) -> ReplyKeyboardMarkup:
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
+    # По 2 кнопки в ряд. Функциональных кнопок нечётное число, поэтому «Забрать
+    # заказ» стоит одной широкой сверху, а «Выйти» — одной широкой снизу.
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_SUMMARY)],
-            [KeyboardButton(text=BTN_PERSONAL)],
             [KeyboardButton(text=BTN_PICKUP)],
-            [KeyboardButton(text=BTN_REMIND)],
-            [KeyboardButton(text=BTN_NOTIFY_TOGGLE)],
-            [KeyboardButton(text=BTN_CHECK_MENU)],
-            [KeyboardButton(text=BTN_RESET)],
+            [KeyboardButton(text=BTN_SUMMARY), KeyboardButton(text=BTN_PERSONAL)],
+            [KeyboardButton(text=BTN_REMIND), KeyboardButton(text=BTN_NOTIFY_TOGGLE)],
+            [KeyboardButton(text=BTN_CHECK_MENU), KeyboardButton(text=BTN_RESET)],
             [KeyboardButton(text=BTN_BACK)],
         ],
         resize_keyboard=True,
