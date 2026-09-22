@@ -58,6 +58,23 @@ def clear_today_order(tg_id: int) -> None:
         )
 
 
+def clear_all_today() -> int:
+    """Удаляет ВСЕ заказы и отказы за сегодня (обнуление админом).
+    Возвращает число затронутых сотрудников (по заказам и отказам)."""
+    today = config.today().isoformat()
+    with _conn() as conn:
+        affected = conn.execute(
+            "SELECT COUNT(DISTINCT tg_id) FROM ("
+            "  SELECT tg_id FROM orders WHERE order_date = ?"
+            "  UNION SELECT tg_id FROM declines WHERE order_date = ?"
+            ")",
+            (today, today),
+        ).fetchone()[0]
+        conn.execute("DELETE FROM orders WHERE order_date = ?", (today,))
+        conn.execute("DELETE FROM declines WHERE order_date = ?", (today,))
+    return affected
+
+
 def get_today_orders():
     """Все строки за сегодня: (tg_id, employee_name, category, dish, price)."""
     with _conn() as conn:

@@ -127,6 +127,7 @@ BTN_REMIND = "🔔 Напомнить не ответившим"
 BTN_NOTIFY_TOGGLE = "📢 Рассылка: вкл/выкл"
 BTN_PICKUP = "📦 Забрать заказ"
 BTN_CHECK_MENU = "🔄 Проверить меню сейчас"
+BTN_RESET = "🗑 Обнулить заказы"
 BTN_BACK = "👤 Выйти из режима администратора"
 
 
@@ -159,6 +160,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_REMIND)],
             [KeyboardButton(text=BTN_NOTIFY_TOGGLE)],
             [KeyboardButton(text=BTN_CHECK_MENU)],
+            [KeyboardButton(text=BTN_RESET)],
             [KeyboardButton(text=BTN_BACK)],
         ],
         resize_keyboard=True,
@@ -851,6 +853,40 @@ async def on_btn_check_menu(message: Message):
         lines.append(f"📅 На завтра ({tomorrow.strftime('%d.%m')}): меню пока нет.")
 
     await message.answer("\n".join(lines), reply_markup=admin_keyboard())
+
+
+@dp.message(F.text == BTN_RESET)
+async def on_btn_reset(message: Message):
+    """Обнуление всех заказов за сегодня — с подтверждением (действие необратимое)."""
+    if not is_admin(message.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🗑 Да, обнулить", callback_data="reset|yes"),
+                InlineKeyboardButton(text="Отмена", callback_data="reset|no"),
+            ]
+        ]
+    )
+    await message.answer(
+        "Обнулить ВСЕ заказы и отказы за сегодня? Это нельзя отменить.\n"
+        "Сотрудники смогут собрать заказ заново.",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("reset|"))
+async def on_reset_confirm(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _, action = callback.data.split("|", 1)
+    if action == "yes":
+        affected = storage.clear_all_today()
+        await callback.message.edit_text(f"✅ Заказы за сегодня обнулены (затронуто сотрудников: {affected}).")
+    else:
+        await callback.message.edit_text("Отменено — заказы не тронуты.")
+    await callback.answer()
 
 
 # ---------- Ручной ввод названия блюда («Другой вариант») ----------
