@@ -123,6 +123,7 @@ BTN_ADMIN = "⚙️ Режим администратора"
 
 # Кнопки режима администратора
 BTN_SUMMARY = "📋 Сводка заказа"
+BTN_PERSONAL = "🧾 Персональные заказы"
 BTN_REMIND = "🔔 Напомнить не ответившим"
 BTN_NOTIFY_TOGGLE = "📢 Рассылка: вкл/выкл"
 BTN_PICKUP = "📦 Забрать заказ"
@@ -156,6 +157,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_SUMMARY)],
+            [KeyboardButton(text=BTN_PERSONAL)],
             [KeyboardButton(text=BTN_PICKUP)],
             [KeyboardButton(text=BTN_REMIND)],
             [KeyboardButton(text=BTN_NOTIFY_TOGGLE)],
@@ -372,10 +374,16 @@ async def broadcast_today_menu() -> bool:
 
 
 async def process_menu_photo(photo, report=None):
-    """photo — aiogram PhotoSize из канала (если бот в нём состоит) или от админа в личке."""
+    """photo — aiogram PhotoSize из канала (если бот в нём состоит) или от админа в личке.
+
+    broadcast=False: пересланное/канальное фото только распознаётся и сохраняется,
+    сотрудникам НЕ рассылается. Рассылка сотрудникам бывает только плановая в
+    CHECK_HOUR:CHECK_MINUTE (см. poll_source_channel). Меню, сохранённое до 10:00,
+    уйдёт сотрудникам плановой рассылкой; после 10:00 — на следующий будний день.
+    """
     file = await bot.get_file(photo.file_id)
     buffer = await bot.download_file(file.file_path)
-    await _handle_new_menu(buffer.read(), photo.file_id, report=report)
+    await _handle_new_menu(buffer.read(), photo.file_id, report=report, broadcast=False)
 
 
 @dp.channel_post(F.photo)
@@ -666,6 +674,48 @@ def build_summary_text() -> str:
     return "\n".join(lines)
 
 
+def build_personal_orders_text() -> str:
+    """Каждый заказ отдельно, по именам: что выбрал сотрудник и его личный итог."""
+    rows = storage.get_today_orders()
+    declined = storage.get_today_declined()
+    if not rows and not declined:
+        return "Пока никто не сделал заказ."
+
+    per_employee = {}
+    for tg_id, emp_name, category, dish, price in rows:
+        per_employee.setdefault(tg_id, {"name": emp_name, "order": {}})
+        per_employee[tg_id]["order"][category] = (dish, price)
+
+    blocks = []
+    for data in sorted(per_employee.values(), key=lambda d: d["name"].lower()):
+        order_map = data["order"]
+        lines = [f"👤 {data['name']}"]
+        has_dish = False
+        for category, label in CATEGORIES:
+            dish, price = order_map.get(category, (None, None))
+            if dish:
+                has_dish = True
+                price_part = f" — {price}₽" if price else ""
+                lines.append(f"  {label}: {dish}{price_part}")
+        if not has_dish:
+            lines.append("  (все категории пропущены)")
+        total, reason = pricing.calculate(order_map)
+        lines.append(f"  Итого: {total}₽ ({reason})")
+        blocks.append("\n".join(lines))
+
+    text = "Персональные заказы на сегодня:\n\n" + "\n\n".join(blocks)
+
+    if declined:
+        text += "\n\n❌ Без обеда: " + ", ".join(n for _, n in sorted(declined, key=lambda x: x[1].lower()))
+
+    answered = set(per_employee) | {tg_id for tg_id, _ in declined}
+    not_answered = [n for tg_id, n in employees.all_employees().items() if tg_id not in answered]
+    if not_answered:
+        text += "\n\n⏳ Не ответили: " + ", ".join(not_answered)
+
+    return text
+
+
 async def do_remind() -> int:
     """Рассылает напоминания тем, кто не ответил. Возвращает число отправленных."""
     answered = {row[0] for row in storage.get_today_orders()}
@@ -742,6 +792,13 @@ async def on_btn_summary(message: Message):
     if not is_admin(message.from_user.id):
         return
     await message.answer(build_summary_text(), reply_markup=admin_keyboard())
+
+
+@dp.message(F.text == BTN_PERSONAL)
+async def on_btn_personal(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(build_personal_orders_text(), reply_markup=admin_keyboard())
 
 
 @dp.message(F.text == BTN_REMIND)
