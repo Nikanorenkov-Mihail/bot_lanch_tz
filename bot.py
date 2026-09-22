@@ -455,6 +455,12 @@ async def _check_channel_once(force: bool = False, broadcast: bool = True) -> bo
 
 async def broadcast_menu_to_employees(photo):
     """photo — либо file_id (строка, из Telegram), либо BufferedInputFile (из скрапера канала)."""
+    # Жёсткий предохранитель: при выключенной рассылке сотрудники НЕ должны
+    # получать автоматических сообщений ни по какому пути. Меню они увидят
+    # только сами, когда нажмут «Собрать обед».
+    if not settings.notifications_enabled():
+        logging.info("Рассылка выключена — рассылку меню сотрудникам пропускаю")
+        return
     for tg_id in employees.all_employees():
         try:
             # новое меню — начинаем день с чистого листа
